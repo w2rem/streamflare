@@ -133,9 +133,53 @@ class TunnelState:
     started_at: float = 0.0
     registered: bool = False
     drain: threading.Thread | None = None
+    wanted: bool = False
+    restarts: int = 0
 
     def tail(self) -> str:
         return "\n".join(self.lines[-TAIL_LINES:])
+
+
+def keep_alive(state: TunnelState) -> None:
+    """Restart a dead connector.
+
+    Streamlit Cloud recycles containers and a tunnel silently drops its edge
+    connections after idle periods. A connector that only runs until someone
+    presses a button answers 502 for everything in between, which looks
+    exactly like a broken tunnel. This runs on its own thread and restarts
+    with a bounded backoff.
+    """
+    backoff = 3.0
+    while True:
+        time.sleep(2)
+        try:
+            if not state.wanted:
+                continue
+            if state.proc is not None and state.proc.poll() is None:
+                backoff = 3.0
+                continue
+            if state.proc is not None:
+                state.restarts += 1
+                state.lines.append(
+                    f"--- connector exited with {state.proc.returncode}; "
+                    f"restart #{state.restarts} in {backoff:.0f}s ---")
+                state.registered = False
+                state.proc = None
+            time.sleep(backoff)
+            fresh = start()
+            fresh.wanted = True
+            state.proc = fresh.proc
+            state.url = fresh.url
+            state.host = fresh.host
+            state.error = fresh.error
+            state.registered = fresh.registered
+            state.drain = fresh.drain
+            if fresh.error:
+                state.lines.append(f"restart failed: {fresh.error}")
+            backoff = min(backoff * 1.6, 60.0)
+        except Exception as exc:
+            state.lines.append(f"keepalive error: {type(exc).__name__}: {exc}")
+            time.sleep(5)
 
 
 def _reader(proc: subprocess.Popen, state: TunnelState, sink: queue.Queue) -> None:
@@ -199,6 +243,13 @@ def start() -> TunnelState:
     # then demands cert.pem ("error parsing tunnel ID: Error locating origin
     # cert"). --token needs no login, which is what makes it work in a
     # container with no home directory.
+    #
+    # No --url here. The tunnel is remotely managed: Cloudflare pushes an
+    # ingress config that pins each hostname to a fixed port, and that config
+    # wins over the flag. Verified — with --url set, cloudflared still logs
+    # `Updated to new configuration config="{... "service":"http://127.0.0.1:8080"}"`.
+    # So the port is changed in the Cloudflare dashboard (or via a local
+    # config.yml), not on the command line.
     cmd = [str(binary), "tunnel", "--no-autoupdate", "--loglevel", "info",
            "run", "--token", tok]
     try:
@@ -229,6 +280,24 @@ def wait_registration(state: TunnelState, timeout_s: int = REGISTER_TIMEOUT_S) -
         if state.registered:
             return
         time.sleep(0.5)
+
+
+INGRESS_RE = re.compile(r'"service":"http://127\.0\.0\.1:(\d+)"')
+
+
+def ingress_port(state: TunnelState) -> int:
+    """The port Cloudflare actually routes to, read back from its own config.
+
+    The tunnel is remotely managed, so the origin port comes from the ingress
+    config Cloudflare pushes — not from ORIGIN_URL, and not from --url, which
+    is ignored when a remote config exists. Reading it back is the only way to
+    tell which port a 502 is about.
+    """
+    for line in reversed(state.lines[-200:]):
+        m = INGRESS_RE.search(line)
+        if m:
+            return int(m.group(1))
+    return 0
 
 
 def check_public(state: TunnelState) -> tuple[int, str]:
@@ -271,6 +340,24 @@ if "sf_state" not in st.session_state:
 state: TunnelState = st.session_state.sf_state
 atexit.register(lambda: stop(state))
 
+# The connector owns itself. A tunnel that only runs while a button is held
+# answers 502 the moment the page is closed, which is indistinguishable from
+# a broken tunnel — so it starts on first paint and a watchdog restarts it.
+token_present = bool((st.secrets.get("TUNNEL_TOKEN")
+                      or os.environ.get("TUNNEL_TOKEN", "")).strip())
+if token_present and not state.wanted:
+    state.wanted = True
+    with st.spinner("downloading client and starting the tunnel…"):
+        fresh = start()
+        fresh.wanted = True
+        st.session_state.sf_state = fresh
+        state = fresh
+        wait_registration(fresh)
+if token_present and not any(t.name == "sf-keepalive"
+                             for t in threading.enumerate()):
+    threading.Thread(target=keep_alive, args=(state,),
+                     name="sf-keepalive", daemon=True).start()
+
 st.title("streamflare")
 st.caption(f"origin {ORIGIN_URL} · client {client_path()}")
 
@@ -279,25 +366,28 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Token", f"{len(token)} chars" if token else "missing")
 c2.metric("Origin", "up" if origin_alive() else "down")
 c3.metric("Registered", "yes" if state.registered else "no")
-c4.metric("Public", "yes" if (state.url or state.host) else "no")
+c4.metric("Restarts", str(state.restarts))
 
 cols = st.columns([1, 1, 1, 2])
 if cols[0].button("Start", type="primary", use_container_width=True,
-                  disabled=state.proc is not None):
+                  disabled=state.wanted):
+    state.wanted = True
     stop(state)
-    fresh = start()
-    st.session_state.sf_state = fresh
-    with st.spinner("waiting for the tunnel to register…"):
+    with st.spinner("starting the tunnel…"):
+        fresh = start()
+        fresh.wanted = True
+        st.session_state.sf_state = fresh
         wait_registration(fresh)
     st.rerun()
-if cols[1].button("Stop", use_container_width=True, disabled=state.proc is None):
+if cols[1].button("Stop", use_container_width=True, disabled=not state.wanted):
+    state.wanted = False
     stop(state)
     st.rerun()
 if cols[2].button("Request", use_container_width=True,
                   disabled=not (state.url or state.host)):
     code, body = check_public(state)
     (st.success if code == 200 else st.error)(
-        f"HTTP {code}" + ("" if code else f" — {body}"))
+        f"HTTP {code}" + ("" if code in (0, 200) else f" — {body[:200]}"))
 
 url = state.url or (f"https://{state.host}" if state.host else "")
 if url:
@@ -309,14 +399,20 @@ if state.error:
 if state.proc is not None and state.proc.poll() is not None:
     st.warning(f"cloudflared exited with {state.proc.returncode} — see the log")
 
+routed = ingress_port(state)
 if origin_alive():
     st.caption(f"Origin answered at {ORIGIN_URL}. A 502 from Cloudflare means the "
                "tunnel is up and the origin is not reachable — the exact dial "
                "error is in the log below.")
 else:
-    st.warning(f"Nothing is listening at {ORIGIN_URL}. Start the local service, "
-               "or set ORIGIN_URL. Requests through the tunnel will return 502 "
-               "until then — that is an origin problem, not a tunnel problem.")
+    st.warning(f"Nothing is listening at {ORIGIN_URL}. Start the local service. "
+               "Requests through the tunnel will return 502 until then.")
+
+if routed and routed != int(ORIGIN_URL.rsplit(":", 1)[-1] or 0):
+    st.error(f"Cloudflare routes this tunnel to port {routed}, but you are "
+             f"showing {ORIGIN_URL}. The port is set in the Cloudflare "
+             f"dashboard, not here — `--url` is ignored when a remote config "
+             f"exists. Either serve on {routed} or change the route to match.")
 
 st.subheader("cloudflared log")
 st.code(state.tail() or "(empty — the tunnel has not produced output yet)",
