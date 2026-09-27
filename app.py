@@ -14,7 +14,7 @@ Run it as a Streamlit app:
 
 Env:
     TUNNEL_TOKEN     the run token from Zero Trust → Networks → Tunnels
-    LOCAL_PORT       local port to expose (default 8080)
+    LOCAL_PORT       local port to expose (default 7932)
     ORIGIN_URL       explicit origin (default http://127.0.0.1:$LOCAL_PORT)
     BINDIR           where cloudflared is cached (default /tmp/bin)
     AUTOSTART        1 = start on first page load (default), 0 = manual
@@ -45,7 +45,7 @@ ASSET = {
     "arm64": "cloudflared-linux-arm64",
     "amd64": "cloudflared-linux-amd64",
 }
-DEFAULT_PORT = int(os.environ.get("LOCAL_PORT", "8080") or 8080)
+DEFAULT_PORT = int(os.environ.get("LOCAL_PORT", "7932") or 7932)
 ORIGIN_URL = os.environ.get("ORIGIN_URL", f"http://127.0.0.1:{DEFAULT_PORT}").strip()
 BINDIR = Path(os.environ.get("BINDIR", "/tmp/bin"))
 TAIL_LINES = 200

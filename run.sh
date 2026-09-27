@@ -14,7 +14,7 @@
 #   TUNNEL_TOKEN=eyJh... ./streamflare/run.sh
 #
 # Optional:
-#   LOCAL_PORT   port the tunnel should reach (default 8080)
+#   LOCAL_PORT   port the tunnel should reach (default 7932)
 #   ORIGIN_URL   explicit origin (default http://127.0.0.1:$LOCAL_PORT)
 #   BINDIR       where cloudflared is cached (default /tmp/bin)
 #   SELF_TEST    1 = start a throwaway origin (default), 0 = use a real one
@@ -24,7 +24,7 @@ APP_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BINDIR="${BINDIR:-/tmp/bin}"
 CLOUDFLARED="$BINDIR/cloudflared"
 BASE_URL="https://github.com/cloudflare/cloudflared/releases/latest/download"
-LOCAL_PORT="${LOCAL_PORT:-8080}"
+LOCAL_PORT="${LOCAL_PORT:-7932}"
 ORIGIN_URL="${ORIGIN_URL:-http://127.0.0.1:$LOCAL_PORT}"
 LOG="$APP_ROOT/tunnel.log"
 tmp="$(mktemp -d)"
