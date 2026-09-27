@@ -93,19 +93,28 @@ fi
 
 # ── origin ───────────────────────────────────────────────────────────
 # cloudflared starts and registers with nothing listening, but every request
-# then 502s — which proves the handshake and nothing else. A throwaway origin
-# makes the test meaningful: 200 through the tunnel exercises the whole path.
-start_origin() {
+# then 502s — which proves the handshake and nothing else. When the real
+# origin already answers, use it; otherwise start a throwaway one so the test
+# measures the whole path instead of just the registration.
+origin_up() {
+  curl -fsS --max-time 3 "$ORIGIN_URL" >/dev/null 2>&1
+}
+
+# Pick an implementation that exists in this image. Order matters: the
+# Streamlit image has python3 but no busybox and no nc, and an earlier
+# version of this script dropped python from the list — which is why the
+# origin never came up there and every request 502'd.
+start_throwaway() {
+  if command -v python3 >/dev/null 2>&1; then
+    say "starting python http.server origin on 127.0.0.1:$LOCAL_PORT"
+    printf 'streamflare-origin-ok\n' > "$tmp/index.html"
+    ( cd "$tmp" && exec python3 -m http.server "$LOCAL_PORT" --bind 127.0.0.1 ) >/dev/null 2>&1 &
+    return 0
+  fi
   if command -v busybox >/dev/null 2>&1 && busybox httpd -h >/dev/null 2>&1; then
     say "starting busybox httpd origin on 127.0.0.1:$LOCAL_PORT"
     printf 'streamflare-origin-ok\n' > "$tmp/index.html"
     busybox httpd -f -p "127.0.0.1:$LOCAL_PORT" -h "$tmp" >/dev/null 2>&1 &
-    return 0
-  fi
-  if command -v python3 >/dev/null 2>&1; then
-    say "starting python http.server origin on 127.0.0.1:$LOCAL_PORT"
-    printf 'streamflare-origin-ok\n' > "$tmp/index.html"
-    ( cd "$tmp" && python3 -m http.server "$LOCAL_PORT" --bind 127.0.0.1 ) >/dev/null 2>&1 &
     return 0
   fi
   if command -v nc >/dev/null 2>&1; then
@@ -119,33 +128,37 @@ start_origin() {
   return 1
 }
 
-have_origin=0
-if [ "${SELF_TEST:-1}" = "1" ]; then
-  if start_origin; then
-    ORIGIN_PID=$!
-    sleep 1
-    if curl -fsS --max-time 3 "$ORIGIN_URL" >/dev/null 2>&1; then
-      ok "origin answers locally at $ORIGIN_URL"
-      have_origin=1
+if origin_up; then
+  ok "origin already answers at $ORIGIN_URL"
+elif [ "${SELF_TEST:-1}" = "1" ]; then
+  if start_throwaway; then
+    sleep 2
+    if origin_up; then
+      ok "throwaway origin answers at $ORIGIN_URL"
     else
-      warn "origin process started but $ORIGIN_URL did not answer"
+      die "started an origin but $ORIGIN_URL still does not answer.
+This container may lack every http server (python3, busybox httpd, nc).
+Set SELF_TEST=0 and point ORIGIN_URL at a service you start yourself."
     fi
   else
-    warn "no busybox/python3/nc to start a test origin — the tunnel test will stop at registration"
+    die "no python3, busybox httpd or nc to start a test origin.
+Set SELF_TEST=0 and point ORIGIN_URL at a real service."
   fi
+else
+  die "nothing is listening at $ORIGIN_URL and SELF_TEST=0."
 fi
-[ "$have_origin" = "1" ] || say "using whatever is already listening at $ORIGIN_URL"
 
 # ── tunnel ───────────────────────────────────────────────────────────
-# `tunnel run <token>` is token-driven: the token already carries the tunnel
-# id, its credentials and the hostname route, so no config file, no cert.pem
-# and no `tunnel login` are needed. That is what makes it viable in a
-# container where there is no home directory to persist a login into.
+# The token goes through --token, NOT as the positional TUNNEL argument:
+# `tunnel run` treats a positional value as a tunnel name/UUID and then
+# demands cert.pem ("error parsing tunnel ID: Error locating origin cert").
+# --token takes precedence over credentials and needs no login, which is what
+# makes it viable in a container with no home directory.
 say "starting tunnel → $LOG"
 : > "$LOG"
 
 "$CLOUDFLARED" tunnel --no-autoupdate --loglevel info \
-  run "$TUNNEL_TOKEN" >>"$LOG" 2>&1 &
+  run --token "$TUNNEL_TOKEN" >>"$LOG" 2>&1 &
 CF_PID=$!
 
 # ── watch the log ────────────────────────────────────────────────────
@@ -189,6 +202,13 @@ n=$(grep -c "Registered tunnel connection" "$LOG" || true)
 ok "connections registered: $n"
 
 # ── end-to-end ───────────────────────────────────────────────────────
+# A 502 is never a tunnel problem: cloudflared reached the edge and the edge
+# could not reach us. The reason is already in the log, so surface it instead
+# of printing a bare code that sends people hunting in the wrong place.
+origin_detail() {
+  sed -n 's/.*dial tcp \([^"]*\)[:;].*/\1/p' "$LOG" 2>/dev/null | tail -1
+}
+
 if [ -n "$host" ]; then
   ok "public host: $host"
   say "requesting through the tunnel — this is the actual test"
@@ -201,9 +221,11 @@ if [ -n "$host" ]; then
       printf '       Egress to Cloudflare works from this container.\n'
       ;;
     502|503)
-      warn "HTTP $code — tunnel is up, origin is not answering"
-      printf '     The network path works; check the service on %s.\n' "$ORIGIN_URL"
-      printf '\n\033[33;1mPARTIAL\033[0m — tunnel usable, origin needs attention.\n'
+      detail=$(origin_detail)
+      warn "HTTP $code — the tunnel is up, the origin is not answering"
+      printf '     cloudflared said: %s\n' "${detail:-no dial error found in the log}"
+      printf '     Start the service on %s, or set ORIGIN_URL to where it listens.\n' "$ORIGIN_URL"
+      printf '\n\033[33;1mPARTIAL\033[0m — tunnel usable, origin missing.\n'
       ;;
     *)
       warn "HTTP $code"

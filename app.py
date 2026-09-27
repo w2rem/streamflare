@@ -189,13 +189,18 @@ def start() -> TunnelState:
     except Exception as exc:
         state.error = f"{type(exc).__name__}: {exc}"
         return state
-    cmd = [str(binary), "tunnel", "--no-autoupdate", "--loglevel", "info",
-           "run", st.secrets.get("TUNNEL_TOKEN")
-           or os.environ.get("TUNNEL_TOKEN", "")]
-    if not cmd[-1]:
+    tok = (st.secrets.get("TUNNEL_TOKEN") or os.environ.get("TUNNEL_TOKEN", "")).strip()
+    if not tok:
         state.error = ("TUNNEL_TOKEN is not set. Add it under Settings → Secrets "
                        "or export it in the environment.")
         return state
+    # The token must be passed as --token, not positionally: a positional
+    # argument to `tunnel run` is read as a tunnel name/UUID, and cloudflared
+    # then demands cert.pem ("error parsing tunnel ID: Error locating origin
+    # cert"). --token needs no login, which is what makes it work in a
+    # container with no home directory.
+    cmd = [str(binary), "tunnel", "--no-autoupdate", "--loglevel", "info",
+           "run", "--token", tok]
     try:
         state.proc = subprocess.Popen(  # noqa: S603
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -227,6 +232,13 @@ def wait_registration(state: TunnelState, timeout_s: int = REGISTER_TIMEOUT_S) -
 
 
 def check_public(state: TunnelState) -> tuple[int, str]:
+    """Request through the tunnel.
+
+    A 502 is never a tunnel failure: cloudflared reached the edge and the edge
+    could not reach the origin. The edge's own reason is already in the log, so
+    return it alongside the code instead of a bare number that sends people
+    hunting in the wrong place.
+    """
     url = state.url or (f"https://{state.host}" if state.host else "")
     if not url:
         return 0, "no public hostname yet"
@@ -234,9 +246,21 @@ def check_public(state: TunnelState) -> tuple[int, str]:
         with urllib.request.urlopen(url, timeout=25) as resp:  # noqa: S310
             return resp.status, resp.read(400).decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read(400).decode("utf-8", "replace")
+        body = exc.read(400).decode("utf-8", "replace")
+        if exc.code in (502, 503):
+            return exc.code, _origin_detail(state) or body
+        return exc.code, body
     except Exception as exc:
         return 0, f"{type(exc).__name__}: {exc}"
+
+
+def _origin_detail(state: TunnelState) -> str:
+    """The edge's dial error, pulled out of cloudflared's own log."""
+    for line in reversed(state.lines[-60:]):
+        m = re.search(r"dial tcp ([^;\"]+)", line)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 # ── UI ────────────────────────────────────────────────────────────────
@@ -286,11 +310,13 @@ if state.proc is not None and state.proc.poll() is not None:
     st.warning(f"cloudflared exited with {state.proc.returncode} — see the log")
 
 if origin_alive():
-    st.caption("Origin answered. A 502 from Cloudflare means the tunnel is up "
-               "and the origin is not reachable, not the other way round.")
+    st.caption(f"Origin answered at {ORIGIN_URL}. A 502 from Cloudflare means the "
+               "tunnel is up and the origin is not reachable — the exact dial "
+               "error is in the log below.")
 else:
     st.warning(f"Nothing is listening at {ORIGIN_URL}. Start the local service, "
-               "or set ORIGIN_URL to point at it.")
+               "or set ORIGIN_URL. Requests through the tunnel will return 502 "
+               "until then — that is an origin problem, not a tunnel problem.")
 
 st.subheader("cloudflared log")
 st.code(state.tail() or "(empty — the tunnel has not produced output yet)",
